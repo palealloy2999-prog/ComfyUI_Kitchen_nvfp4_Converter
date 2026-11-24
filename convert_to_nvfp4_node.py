@@ -32,6 +32,67 @@ INT4_QUANT_GROUPSIZE = 64
 W4A8_GROUPSIZE = 16
 
 
+def _canonical_layer_name(name):
+    for prefix in ("model.diffusion_model.", "diffusion_model.", "model."):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _read_source_quantization_configs(input_path, state_dict):
+    configs = {}
+
+    def add_config(layer_name, config):
+        if not isinstance(config, dict):
+            raise ValueError(f"Invalid quantization config for layer {layer_name}")
+        canonical_name = _canonical_layer_name(layer_name)
+        previous = configs.get(canonical_name)
+        if previous is not None and previous != config:
+            raise ValueError(f"Conflicting quantization configs for layer {layer_name}")
+        configs[canonical_name] = config
+
+    for key, tensor in state_dict.items():
+        if not key.endswith(".comfy_quant"):
+            continue
+        raw_config = tensor.detach().to(device="cpu").contiguous().view(torch.uint8).numpy().tobytes()
+        add_config(key[:-len(".comfy_quant")], json.loads(raw_config.decode("utf-8")))
+
+    with safetensors.safe_open(input_path, framework="pt", device="cpu") as f:
+        metadata = f.metadata() or {}
+    metadata_quantization = metadata.get("_quantization_metadata")
+    if metadata_quantization:
+        quantization = json.loads(metadata_quantization)
+        for layer_name, config in quantization.get("layers", {}).items():
+            add_config(layer_name, config)
+
+    return configs
+
+
+def _dequantize_int8_weight(qdata, scale, layer_config, device):
+    params_config = layer_config.get("params", {})
+    if not isinstance(params_config, dict):
+        params_config = {}
+    convrot = bool(layer_config.get("convrot", params_config.get("convrot", False)))
+    convrot_groupsize = int(
+        layer_config.get("convrot_groupsize", params_config.get("convrot_groupsize", CONVROT_GROUPSIZE))
+    )
+
+    if qdata.dtype == torch.uint8:
+        qdata = qdata.view(torch.int8)
+    elif qdata.dtype != torch.int8:
+        raise ValueError(f"Expected INT8 weight data, got {qdata.dtype}")
+
+    params = TensorWiseINT8Layout.Params(
+        scale=scale.to(device=device, dtype=torch.float32),
+        orig_dtype=torch.bfloat16,
+        orig_shape=tuple(qdata.shape),
+        is_weight=True,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
+    )
+    return TensorWiseINT8Layout.dequantize(qdata.to(device=device), params)
+
+
 def _pick_convrot_groupsize(k, preferred=CONVROT_GROUPSIZE):
     """Plus grand groupsize ConvRot divisant K.
 
@@ -171,6 +232,40 @@ class ConvertToNVFP4:
                             temp_diffusers_meta[key] = orig_meta[key]
 
         sd = safetensors.torch.load_file(input_path)
+        source_quant_configs = _read_source_quantization_configs(input_path, sd)
+        source_quant_configs_by_weight = {}
+        source_quant_scale_keys = set()
+        matched_source_quant_layers = set()
+        for key, tensor in sd.items():
+            if not key.endswith(".weight"):
+                continue
+            layer_name = key[:-len(".weight")]
+            canonical_name = _canonical_layer_name(layer_name)
+            layer_config = source_quant_configs.get(canonical_name)
+            if layer_config is None:
+                continue
+            if tensor.ndim != 2:
+                raise ValueError(f"Quantized source layer {layer_name} is not a 2D weight")
+            if layer_config.get("format") != "int8_tensorwise":
+                raise ValueError(
+                    f"Cannot convert source quantization format "
+                    f"{layer_config.get('format')} for layer {layer_name}; "
+                    "only INT8 ConvRot is supported as a quantized input."
+                )
+            params_config = layer_config.get("params", {})
+            if not isinstance(params_config, dict):
+                params_config = {}
+            if not layer_config.get("convrot", params_config.get("convrot", False)):
+                raise ValueError(f"INT8 layer {layer_name} is not ConvRot-quantized")
+            source_quant_configs_by_weight[key] = layer_config
+            source_quant_scale_keys.add(f"{layer_name}.weight_scale")
+            matched_source_quant_layers.add(canonical_name)
+
+        unmatched_source_quant_layers = set(source_quant_configs) - matched_source_quant_layers
+        if unmatched_source_quant_layers:
+            first_layer = sorted(unmatched_source_quant_layers)[0]
+            raise ValueError(f"Quantized source metadata has no matching weight for layer {first_layer}")
+
         quant_map = {"format_version": "1.0", "layers": {}}
         new_sd = {}
         
@@ -180,13 +275,32 @@ class ConvertToNVFP4:
         for i, (k, v) in enumerate(sd.items()):
             pbar.update_absolute(i + 1)
 
-            if any(name in k for name in BLACKLIST):
-                new_sd[k] = v.to(dtype=torch.bfloat16)
+            if k.endswith(".comfy_quant") or k in source_quant_scale_keys:
                 continue
 
             if v.ndim == 2 and ".weight" in k:
                 base_k_file = k.replace(".weight", "")
-                
+                source_layer_config = source_quant_configs_by_weight.get(k)
+                scale = None
+                if source_layer_config is not None:
+                    scale = sd.get(f"{base_k_file}.weight_scale")
+                    if scale is None:
+                        raise ValueError(f"Missing INT8 weight scale for layer {base_k_file}")
+
+                if any(name in k for name in BLACKLIST):
+                    if source_layer_config is None:
+                        new_sd[k] = v.to(dtype=torch.bfloat16)
+                    else:
+                        v_tensor = _dequantize_int8_weight(v, scale, source_layer_config, device)
+                        new_sd[k] = v_tensor.to(dtype=torch.bfloat16).cpu()
+                        if device == "cuda": del v_tensor
+                    continue
+
+                if source_layer_config is not None:
+                    v_tensor = _dequantize_int8_weight(v, scale, source_layer_config, device)
+                else:
+                    v_tensor = v.to(device=device, dtype=torch.bfloat16)
+
                 if model_type == "LTX-2-19b-dev-or-distilled":
                     base_k_meta = k.replace(".weight", "") 
                 else:
@@ -195,8 +309,6 @@ class ConvertToNVFP4:
                     else:
                         base_k_meta = base_k_file
       
-                v_tensor = v.to(device=device, dtype=torch.bfloat16)
-
                 if FP8_LAYERS and any(name in k for name in FP8_LAYERS):
                     print(f"🌸 FP8 Cuisine : {k}")
                     weight_scale = (v_tensor.abs().max() / 448.0).clamp(min=1e-12).float()
@@ -207,6 +319,14 @@ class ConvertToNVFP4:
                     if device == "cuda": del v_tensor
                     continue
 
+            elif any(name in k for name in BLACKLIST):
+                new_sd[k] = v.to(dtype=torch.bfloat16)
+                continue
+            else:
+                new_sd[k] = v.to(dtype=torch.bfloat16)
+                continue
+
+            if v.ndim == 2 and ".weight" in k:
                 print(f"💎 {quant_format} : {k}")
                 try:
                     # Selection du layout et des arguments propres a chaque format
@@ -270,11 +390,9 @@ class ConvertToNVFP4:
                     quant_map["layers"][base_k_meta] = layer_conf
                 except Exception as e:
                     print(f"⚠️ {k} non quantifiable ({e}) → bf16")
-                    new_sd[k] = v.to(dtype=torch.bfloat16)
+                    new_sd[k] = v_tensor.to(dtype=torch.bfloat16).cpu()
                 
                 if device == "cuda": del v_tensor
-            else:
-                new_sd[k] = v.to(dtype=torch.bfloat16)
 
         final_metadata = OrderedDict()
         final_metadata["_quantization_metadata"] = json.dumps(quant_map)

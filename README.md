@@ -1,6 +1,6 @@
 # ComfyUI Kitchen Quant Converter
 
-Please, only use the original files (bf16/fp16, not fp8, fine-tuned/merged or not) from comfyui. https://huggingface.co/Comfy-Org
+Use the original BF16/FP16 checkpoint whenever possible. INT8_CONVROT checkpoints can also be converted: their weights are dequantized to BF16 before the selected output quantization is applied, which can add quality loss compared with quantizing the original checkpoint. Other already-quantized input formats are not supported.
 
 # Mise à jour :
 
